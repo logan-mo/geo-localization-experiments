@@ -1,0 +1,24 @@
+[project]
+name = "geo-localization-experiments"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "pandas",
+    "pillow",
+    "tqdm",
+    "matplotlib",
+    "piexif",
+    "ipykernel",
+    "jupyter",
+    "scipy",
+    "torch",
+    "torchvision",
+    "kornia",
+    "romatch",
+    #"lightglue",
+    "onnxruntime-gpu",
+]
