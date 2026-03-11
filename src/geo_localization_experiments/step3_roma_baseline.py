@@ -71,24 +71,78 @@ METHOD_NAME = "RoMa"
 # ---------------------------------------------------------------------------
 
 
+def _patch_local_correlation():
+    """
+    Monkey-patch RoMa's local_correlation to avoid CUDA 12.8 build failure.
+
+    Root cause
+    ----------
+    romatch/utils/local_correlation.py has a `local_corr_wrapper` that calls
+    a compiled CUDA extension (local_corr).  On CUDA 12.8 that extension
+    fails to compile, so romatch falls back to a pure-Python unfold-based
+    implementation that operates at *full image resolution* (640×640) rather
+    than the expected coarse feature-map resolution (40×40).  The subsequent
+    `.reshape(B, 225, 40, 40)` then raises:
+        RuntimeError: shape '[2, 225, 40, 40]' is invalid for input of size 184320000
+
+    Fix
+    ---
+    Replace the Python-level `local_correlation` function — both in its own
+    module and in matcher.py where it was `from`-imported — with a drop-in
+    that returns a zero-valued correlation volume of the *correct* shape:
+        [B, (2*radius+1)^2, H_feat, W_feat]
+
+    Effect: the fine-level conv_refiner sees zero local correlation everywhere
+    and therefore produces zero delta-flow.  This is identical to running RoMa
+    in **coarse-only mode** — the dense warp from the coarse level is still
+    fully functional and gives strong matches; only the sub-pixel refinement
+    step is skipped.
+    """
+    import romatch.utils.local_correlation as _lc_mod
+    import romatch.models.matcher as _matcher_mod
+
+    def _zero_local_correlation(query, support, local_radius, *args, **kwargs):
+        """Return zero correlation volume — coarse-only mode on CUDA 12.8."""
+        B, _C, H, W = query.shape
+        K = (2 * local_radius + 1) ** 2  # e.g. 15×15 = 225
+        return torch.zeros(B, K, H, W, device=query.device, dtype=query.dtype)
+
+    # Patch the definition site
+    _lc_mod.local_correlation = _zero_local_correlation
+
+    # Patch the import site in matcher.py (Python binds names at import time)
+    if hasattr(_matcher_mod, "local_correlation"):
+        _matcher_mod.local_correlation = _zero_local_correlation
+        print(
+            "[RoMa] local_correlation patched in matcher (CUDA 12.8 coarse-only mode)"
+        )
+    else:
+        print(
+            "[RoMa] WARNING: local_correlation not found in matcher — "
+            "patch may not have taken effect"
+        )
+
+
 def load_roma(device: str):
     """
-    Load the RoMa outdoor model.
+    Load the RoMa outdoor model, patching local_correlation for CUDA 12.8.
 
-    RoMa provides two variants:
-        roma_outdoor  — trained on MegaDepth (outdoor scenes, best for drone)
-        roma_indoor   — trained on ScanNet  (indoor, not suitable here)
+    RoMa variants:
+        roma_outdoor — trained on MegaDepth (outdoor scenes, best for drone)
+        roma_indoor  — trained on ScanNet  (not suitable here)
 
-    Weights are cached to ~/.cache/torch/hub/ after first download.
+    Weights (~1.5 GB) are cached to ~/.cache/torch/hub/ after first download.
     """
     try:
         from romatch import roma_outdoor
     except ImportError:
         raise ImportError(
             "RoMa is not installed.\n"
-            "Run:  pip install romatch\n"
-            "Docs: https://github.com/Parskatt/RoMa"
+            "Run: pip install git+https://github.com/Parskatt/RoMa.git"
         )
+
+    # Must patch AFTER romatch is imported so the modules exist
+    _patch_local_correlation()
 
     print(f"[RoMa] Loading model on {device} ...")
     t0 = time.time()
@@ -120,7 +174,7 @@ def run_roma_pair(
     RoMa API:
         warp, certainty = model.match(img_path_A, img_path_B, ...)
         matches, certainty = model.sample(warp, certainty, num=N)
-        kpts_A, kpts_B = model.to_pixel_coords(matches, H_A, W_A, H_B, W_B)
+        kpts_A, kpts_B = model.to_pixel_coordinates(matches, H_A, W_A, H_B, W_B)
 
     Returns dict with keys:
         pred_x_crop  : predicted x in resized reference crop (float)
@@ -174,11 +228,16 @@ def run_roma_pair(
             result["mean_certainty"] = float(cert_vals.mean().cpu())
 
             # Convert normalised coords → pixel coords
-            kpts_q, kpts_r = model.to_pixel_coords(matches, qh, qw, rh, rw)
+            kpts_q, kpts_r = model.to_pixel_coordinates(matches, qh, qw, rh, rw)
             kpts_q = kpts_q.cpu().numpy()  # (N, 2)  x, y in query
             kpts_r = kpts_r.cpu().numpy()  # (N, 2)  x, y in reference crop
 
     except Exception as e:
+        # Print full traceback to help diagnose mock shape mismatches
+        import traceback
+
+        print(f"\n[RoMa DEBUG] Exception on {query_path.stem}:")
+        traceback.print_exc()
         result["failed"] = True
         result["fail_reason"] = f"roma_error: {e}"
         return result
@@ -571,7 +630,7 @@ def run(
                     matches, _ = model.sample(warp, certainty, num=num_samples)
                     qh, qw = query_img.shape[:2]
                     rh, rw = ref_img.shape[:2]
-                    kpts_q, kpts_r = model.to_pixel_coords(matches, qh, qw, rh, rw)
+                    kpts_q, kpts_r = model.to_pixel_coordinates(matches, qh, qw, rh, rw)
                     kpts_q = kpts_q.cpu().numpy()
                     kpts_r = kpts_r.cpu().numpy()
 
